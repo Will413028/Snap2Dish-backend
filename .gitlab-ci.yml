@@ -1,0 +1,147 @@
+image: python:3.12-alpine
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  POETRY_HOME: "$CI_PROJECT_DIR/.poetry"
+  POETRY_CACHE_DIR: "$CI_PROJECT_DIR/.poetry-cache"
+  POETRY_VERSION: "1.8.3"
+  DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/test_db
+  SECRET_KEY: SECRET_KEY
+  ALGORITHM: HS256
+  ACCESS_TOKEN_EXPIRE_MINUTES: 30
+
+  # Azure
+  AZURE_BLOB_CONTAINER: test
+  AZURE_BLOB_CONNECTION_STRING: test
+
+  # Redis
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+
+  # Postgres
+  POSTGRES_DB: test_db
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgres
+
+cache:
+  key: "${CI_COMMIT_REF_SLUG}"
+  paths:
+    - .pip-cache/
+    - .poetry-cache/
+    - .venv/
+
+stages:
+  - lint
+  - test
+  - sonarqube-check
+  - build
+  - deploy_dev
+  - deploy_prod
+
+lint:
+  stage: lint
+  script:
+    - pip install ruff
+    - ruff check .
+
+test:
+  stage: test
+  services:
+    - postgres:16-alpine
+  before_script:
+    - python -V
+    - pip install poetry==${POETRY_VERSION}
+    - poetry --version
+    - poetry config virtualenvs.in-project true
+    - poetry install --no-interaction --no-ansi
+  script:
+    - poetry run alembic upgrade head
+    - poetry run alembic check
+    - poetry run python -m pytest -s -v
+  variables:
+    PYTHONDONTWRITEBYTECODE: "1"
+
+sonarqube-check:
+  stage: sonarqube-check
+  image:
+    name: sonarsource/sonar-scanner-cli:11
+    entrypoint: [""]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"
+  script:
+    - sonar-scanner -X -Dsonar.host.url="${SONAR_HOST_URL}"
+  allow_failure: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_COMMIT_BRANCH == 'main'
+
+build:
+  image: docker:latest
+  stage: build
+  services:
+    - docker:dind
+  before_script:
+    - |
+      if [ "$CI_COMMIT_BRANCH" == "main" ]; then
+        export BUILD_DATE=$(date +%Y%m%d)
+        export CI_IMAGE="$CI_IMAGE_REGISTRY_URL:$BUILD_DATE-$CI_COMMIT_SHORT_SHA"
+        export CI_LATEST_IMAGE="$CI_IMAGE_REGISTRY_URL:latest"
+      elif [ "$CI_COMMIT_BRANCH" == "dev" ]; then
+        export CI_IMAGE="$CI_IMAGE_REGISTRY_URL:dev"
+      fi
+  script:
+    - docker build -t "$CI_IMAGE" .
+    - |
+      if [ "$CI_COMMIT_BRANCH" == "main" ]; then
+        docker tag "$CI_IMAGE" "$CI_LATEST_IMAGE"
+      fi
+    - docker login $GITLAB_REGISTRY_URL -u $GITLAB_REGISTRY_USERNAME -p $GITLAB_REGISTRY_PASSWORD
+    - docker push "$CI_IMAGE"
+    - |
+      if [ "$CI_COMMIT_BRANCH" == "main" ]; then
+        docker push "$CI_LATEST_IMAGE"
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev"
+  needs:
+    - job: lint
+    - job: test
+
+deploy_dev:
+  stage: deploy_dev
+  before_script:
+    - apk add --no-cache sshpass openssh-client
+    - pip3 install ansible
+    - mkdir -p ~/.ssh
+    - echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config
+    - chmod 600 ~/.ssh/config
+  script:
+  - ansible --version
+  - ansible-playbook --syntax-check -i ansible/inventory_dev.yml ansible/deploy_dev.yml
+  - ansible-inventory -i ansible/inventory_dev.yml --list
+  - ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -vvv -i ansible/inventory_dev.yml ansible/deploy_dev.yml --extra-vars "ansible_become_password=$DEPLOY_DEV_SERVER_PASSWORD"
+  needs:
+    - job: build
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+
+deploy_prod:
+  stage: deploy_prod
+  before_script:
+    - apk add --no-cache openssh-client
+    - pip3 install ansible
+    - mkdir -p ~/.ssh
+    - echo "$DEPLOY_PROD_SSH_PRIVATE_KEY" | base64 -d > ~/.ssh/ssh_private_key.pem
+    - chmod 600 ~/.ssh/ssh_private_key.pem
+    - echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config
+  script:
+    - ansible --version
+    - ansible-playbook --syntax-check -i ansible/inventory_prod.yml ansible/deploy_prod.yml
+    - ansible-inventory -i ansible/inventory_prod.yml --list
+    - ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -vvv -i ansible/inventory_prod.yml ansible/deploy_prod.yml
+  needs:
+    - job: build
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
